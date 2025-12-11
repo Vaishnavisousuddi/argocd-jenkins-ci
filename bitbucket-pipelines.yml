@@ -1,0 +1,63 @@
+image: atlassian/default-image:3
+
+options:
+  docker: true
+
+pipelines:
+  default:
+    - step:
+        name: SonarQube Scan
+        script:
+          - echo " Running SonarQube Scan..."
+          - apt-get update && apt-get install -y unzip wget openjdk-11-jre
+          - wget https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-5.0.1.3006-linux.zip
+          - unzip sonar-scanner-cli-5.0.1.3006-linux.zip
+          - export PATH="$PATH:$(pwd)/sonar-scanner-5.0.1.3006-linux/bin"
+          - sonar-scanner \
+              -Dsonar.projectKey=$SONAR_PROJECT_KEY \
+              -Dsonar.sources=. \
+              -Dsonar.host.url=$SONAR_HOST_URL \
+              -Dsonar.login=$SONAR_TOKEN
+
+    - step:
+        name: Build & Push Image to ECR
+        services:
+          - docker
+        script:
+          - echo " Logging into ECR..."
+          - aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REPO
+
+          # Generate version tag v1, v2, v3...
+          - export VERSION_FILE=".version"
+          - if [ ! -f $VERSION_FILE ]; then echo 1 > $VERSION_FILE; fi
+          - export VERSION=$(cat $VERSION_FILE)
+          - export IMAGE_TAG="v${VERSION}"
+          - echo "$((VERSION + 1))" > $VERSION_FILE
+          - echo $IMAGE_TAG > image_tag.txt
+
+          - echo "Building image $ECR_REPO:$IMAGE_TAG"
+          - docker build -t $ECR_REPO:$IMAGE_TAG .
+          - docker push $ECR_REPO:$IMAGE_TAG
+
+    - step:
+        name: Update GitOps Repo (values.yaml)
+        script:
+          - echo " Updating GitOps repo with new image tag..."
+          - export IMAGE_TAG=$(cat image_tag.txt)
+
+          # SSH clone using pipeline key
+          - git clone git@bitbucket.org:vaishnavi-workspace/gitops-nginx.git
+          - cd gitops-nginx/nginx-site
+
+          - apk add --no-cache yq
+          - yq -i ".image.tag = \"$IMAGE_TAG\"" values.yaml
+
+          - git config --global user.email "bitbucket@ci.com"
+          - git config --global user.name "bitbucket-ci"
+          - git commit -am "deploy update image tag to $IMAGE_TAG"
+          - git push
+
+    - step:
+        name: ArgoCD Deployment
+        script:
+          - echo "ArgoCD auto-sync will detect the GitOps change and deploy automatically."
