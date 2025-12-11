@@ -8,55 +8,106 @@ pipelines:
     - step:
         name: SonarQube Scan
         script:
-          - echo " Running SonarQube Scan..."
+          - echo "🔍 Running SonarQube Scan..."
           - apt-get update && apt-get install -y unzip wget openjdk-11-jre
           - wget https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-5.0.1.3006-linux.zip
           - unzip sonar-scanner-cli-5.0.1.3006-linux.zip
           - export PATH="$PATH:$(pwd)/sonar-scanner-5.0.1.3006-linux/bin"
-          - sonar-scanner \
-              -Dsonar.projectKey=$SONAR_PROJECT_KEY \
-              -Dsonar.sources=. \
-              -Dsonar.host.url=$SONAR_HOST_URL \
-              -Dsonar.login=$SONAR_TOKEN
+          - sonar-scanner -Dsonar.projectKey="$SONAR_PROJECT_KEY" -Dsonar.sources="." -Dsonar.host.url="$SONAR_HOST_URL" -Dsonar.login="$SONAR_TOKEN"
+         
 
     - step:
         name: Build & Push Image to ECR
         services:
           - docker
         script:
+          - echo " Installing AWS CLI..."
+          - apt-get update && apt-get install -y awscli jq git
+
+          - echo "$BITBUCKET_STEP_OIDC_TOKEN" > /tmp/bb_token
+          - export AWS_WEB_IDENTITY_TOKEN_FILE="/tmp/bb_token"
+          - export AWS_ROLE_ARN="$ROLE_ARN"
+          - export AWS_DEFAULT_REGION="$AWS_REGION"
+            echo "====== DECODE BITBUCKET OIDC TOKEN ======"
+            python3 - <<'PY'
+            import json, base64, os
+            tok = os.environ.get("BITBUCKET_STEP_OIDC_TOKEN","")
+            payload = tok.split(".")[1] + "==="
+            payload = payload.replace("-", "+").replace("_", "/")
+            data = json.loads(base64.b64decode(payload))
+            print("iss =", data.get("iss"))
+            print("aud =", data.get("aud"))
+            print("sub =", data.get("sub"))
+            PY
+            echo "========================================="
+
+          - echo " Checking AWS identity..."
+          - aws sts get-caller-identity
+
           - echo " Logging into ECR..."
           - aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REPO
 
-          # Generate version tag v1, v2, v3...
-          - export VERSION_FILE=".version"
-          - if [ ! -f $VERSION_FILE ]; then echo 1 > $VERSION_FILE; fi
-          - export VERSION=$(cat $VERSION_FILE)
-          - export IMAGE_TAG="v${VERSION}"
-          - echo "$((VERSION + 1))" > $VERSION_FILE
-          - echo $IMAGE_TAG > image_tag.txt
+          # Generate version tag v1, v2, v3, v4.
+          - echo " Fetching last deployed version from GitOps repo..."
+          - git clone --depth 1 https://$GITOPS_USER:$GITOPS_TOKEN@bitbucket.org/ammu-workspace/gitops-nginx.git tmpgit
+          - CUR=$(grep -Eo 'v[0-9]+' tmpgit/nginx-site/values.yaml | head -1 | sed 's/v//')
+          - rm -rf tmpgit
+          - if [ -z "$CUR" ]; then CUR=0; fi
+          - IMAGE_TAG="v$((CUR+1))"
+          - echo " New IMAGE_TAG=$IMAGE_TAG"
+          - echo "$IMAGE_TAG" > image_tag.txt
 
           - echo "Building image $ECR_REPO:$IMAGE_TAG"
           - docker build -t $ECR_REPO:$IMAGE_TAG .
           - docker push $ECR_REPO:$IMAGE_TAG
 
+        artifacts:
+          - image_tag.txt
+        
     - step:
         name: Update GitOps Repo (values.yaml)
         script:
           - echo " Updating GitOps repo with new image tag..."
-          - export IMAGE_TAG=$(cat image_tag.txt)
+          - set -euo pipefail
+          - echo "DEBUG workspace before reading artifact:"
+          - ls -la || true
+
+          # ensure artifact exists
+          - if [ ! -f image_tag.txt ]; then echo "ERROR image_tag.txt missing — the build step did not produce it." >&2; exit 1; fi
+          - IMAGE_TAG=$(cat image_tag.txt)
+          - echo "DEBUG IMAGE_TAG=$IMAGE_TAG"
+
+          # write ~/.netrc as a single YAML block scalar (correct indentation!)
+          - |
+            cat > ~/.netrc <<EOF
+            machine bitbucket.org
+            login $GITOPS_USER
+            password $GITOPS_TOKEN
+            EOF
+          - chmod 600 ~/.netrc
 
           # SSH clone using pipeline key
-          - git clone git@bitbucket.org:vaishnavi-workspace/gitops-nginx.git
+          - git clone https://bitbucket.org/ammu-workspace/gitops-nginx.git
           - cd gitops-nginx/nginx-site
 
-          - apk add --no-cache yq
-          - yq -i ".image.tag = \"$IMAGE_TAG\"" values.yaml
+          # install curl (Debian) and download yq (mikefarah)
+          - apt-get update && apt-get install -y curl
+          - curl -sL "https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64" -o /usr/local/bin/yq
+          - chmod +x /usr/local/bin/yq
+
+          # update the tag in values.yaml (YAML-safe)
+          - /usr/local/bin/yq -i ".image.tag = \"$IMAGE_TAG\"" values.yaml
 
           - git config --global user.email "bitbucket@ci.com"
           - git config --global user.name "bitbucket-ci"
-          - git commit -am "deploy update image tag to $IMAGE_TAG"
-          - git push
+          - git add values.yaml
+          - git commit -am "deploy update image tag to $IMAGE_TAG" || true
+        
+          # change remote to HTTPS (git will use ~/.netrc) and push to main
+          - git remote set-url origin https://bitbucket.org/ammu-workspace/gitops-nginx.git
+          - git push origin HEAD:main
 
+         
     - step:
         name: ArgoCD Deployment
         script:
