@@ -2,7 +2,7 @@ pipeline {
   agent any
   environment {
     AWS_DEFAULT_REGION = 'ap-south-1'
-    ACCOUNT_ID = '559050211335'
+    ACCOUNT_ID = '${ACCOUNT_ID}'
     ECR_REPO = "${ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com/nginx-app"
     GITOPS_REPO = "https://github.com/Vaishnavisousuddi/gitops-nginx.git"
     APP_PATH = "nginx-site"
